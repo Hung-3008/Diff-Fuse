@@ -143,6 +143,7 @@ class BraTSTrainer(Trainer):
         self.bce = nn.BCEWithLogitsLoss()
         self.dice_loss = DiceLoss(sigmoid=True)
         self.start_epoch = 0  # Initialize start_epoch
+        self.global_step = 0  # Initialize global_step
 
         if checkpoint_path:
             self.load_checkpoint(checkpoint_path)
