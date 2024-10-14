@@ -341,30 +341,16 @@ class BasicUNetDe(nn.Module):
         temb = nonlinearity(temb)
         temb = self.temb.dense[1](temb)
 
+
+
+        if image is not None :
+            x = torch.cat([image, x], dim=1)
+
         x0 = self.conv_0(x, temb)
-        if embeddings is not None:
-            x0 = torch.cat([x0, embeddings[0]], dim=1)
-            x0 = self.conv_fusion0(x0, temb)
-        
         x1 = self.down_1(x0, temb)
-        if embeddings is not None:
-            x1 = torch.cat([x1, embeddings[1]], dim=1)
-            x1 = self.conv_fusion1(x1, temb)
-        
         x2 = self.down_2(x1, temb)
-        if embeddings is not None:
-            x2 = torch.cat([x2, embeddings[2]], dim=1)
-            x2 = self.conv_fusion2(x2, temb)
-        
         x3 = self.down_3(x2, temb)
-        if embeddings is not None:
-            x3 = torch.cat([x3, embeddings[3]], dim=1)
-            x3 = self.conv_fusion3(x3, temb)
-        
-        x4 = self.down_4(x3, temb)
-        if embeddings is not None:
-            x4 = torch.cat([x4, embeddings[4]], dim=1)
-            x4 = self.conv_fusion4(x4, temb)        
+        x4 = self.down_4(x3, temb)     
 
         u4 = self.upcat_4(x4, x3, temb)
         u3 = self.upcat_3(u4, x2, temb)

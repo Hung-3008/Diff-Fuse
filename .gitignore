@@ -127,3 +127,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+./BraTS2020/datasets
+BraTS2020/datasets
+logs_brats
+bugs.txt
