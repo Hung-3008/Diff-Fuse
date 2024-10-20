@@ -8,6 +8,8 @@ from monai.inferers import SlidingWindowInferer
 from monai.utils import set_determinism
 from monai.losses.dice import DiceLoss
 from collections import OrderedDict
+from torch.utils.data import Subset
+import random
 
 from dataset.brats_data_utils_multi_label import get_loader_brats
 from light_training.evaluation.metric import dice
@@ -51,7 +53,7 @@ class FusionDiff(nn.Module):
 
         self.model = BasicUNetDe(
             3,
-            number_targets,
+            number_targets + number_modality,
             number_targets,
             [64, 64, 128, 256, 512, 64],
             act=("LeakyReLU", {"negative_slope": 0.1, "inplace": False}),
@@ -87,10 +89,11 @@ class FusionDiff(nn.Module):
 
         elif pred_type == "ddim_sample":
             embeddings = self.embed_model(image)
-
+            batch_size = image.shape[0]
+            sample_shape = (batch_size, number_targets, 96, 96, 96)
             sample_out = self.sample_diffusion.ddim_sample_loop(
                 self.model,
-                (1, number_targets, 96, 96, 96),
+                sample_shape,
                 model_kwargs={"image": image, "embeddings": embeddings},
             )
             sample_out = sample_out["pred_xstart"]
@@ -143,11 +146,13 @@ class BraTSTrainer(Trainer):
         self.bce = nn.BCEWithLogitsLoss()
         self.dice_loss = DiceLoss(sigmoid=True)
         self.start_epoch = 0  # Initialize start_epoch
+        self.global_step = 0  # Initialize global_step
 
         if checkpoint_path:
             self.load_checkpoint(checkpoint_path)
 
         # Handle multiple GPUs if specified
+        self.num_gpus = num_gpus  # Add this line
         if num_gpus > 1:
             self.model = nn.DataParallel(self.model)
 
@@ -196,6 +201,9 @@ class BraTSTrainer(Trainer):
 
         x_start = x_start * 2 - 1
         x_t, t, noise = self.model(x=x_start, pred_type="q_sample")
+
+        # print("x_t shape", x_t.shape)
+        # print("image shape", image.shape)
         pred_xstart = self.model(
             x=x_t, step=t, image=image, pred_type="denoise"
         )
@@ -203,8 +211,8 @@ class BraTSTrainer(Trainer):
         loss_dice = self.dice_loss(pred_xstart, label)
         loss_bce = self.bce(pred_xstart, label)
 
-        pred_xstart = torch.sigmoid(pred_xstart)
-        loss_mse = self.mse(pred_xstart, label)
+        pred_xstart_sigmoid = torch.sigmoid(pred_xstart)
+        loss_mse = self.mse(pred_xstart_sigmoid, label)
 
         loss = loss_dice + loss_bce + loss_mse
 
@@ -219,36 +227,31 @@ class BraTSTrainer(Trainer):
         return image, label
 
     def validation_step(self, batch):
-        image, label = self.get_input(batch)
+        image, label = self.get_input(batch)    
+        
+        output = self.window_infer(image, self.model, pred_type="ddim_sample")
 
-        self.model.eval()
-        with torch.no_grad():
-            output = self.window_infer(
-                image, self.model, pred_type="ddim_sample"
-            )
-            output = torch.sigmoid(output)
-            output = (output > 0.5).float().cpu().numpy()
-            target = label.cpu().numpy()
-            # Whole Tumor (WT)
-            o = output[:, 1]
-            t = target[:, 1]
-            wt = dice(o, t)
-            # Tumor Core (TC)
-            o = output[:, 0]
-            t = target[:, 0]
-            tc = dice(o, t)
-            # Enhancing Tumor (ET)
-            o = output[:, 2]
-            t = target[:, 2]
-            et = dice(o, t)
-        self.model.train()
+        output = torch.sigmoid(output)
+
+        output = (output > 0.5).float().cpu().numpy()
+
+        target = label.cpu().numpy()
+        o = output[:, 1]
+        t = target[:, 1] # ce
+        wt = dice(o, t)
+        # core
+        o = output[:, 0]
+        t = target[:, 0]
+        tc = dice(o, t)
+        # active
+        o = output[:, 2]
+        t = target[:, 2]
+        et = dice(o, t)
+        
         return [wt, tc, et]
 
-    def validation_end(self, val_outputs):
-        wt_list, tc_list, et_list = zip(*val_outputs)
-        wt = np.mean(wt_list)
-        tc = np.mean(tc_list)
-        et = np.mean(et_list)
+    def validation_end(self, mean_val_outputs):
+        wt, tc, et = mean_val_outputs
 
         self.log("wt", wt, step=self.epoch)
         self.log("tc", tc, step=self.epoch)
@@ -281,30 +284,10 @@ class BraTSTrainer(Trainer):
             f"wt is {wt:.4f}, tc is {tc:.4f}, et is {et:.4f}, mean_dice is {mean_dice:.4f}"
         )
 
-    def train(self, train_dataset, val_dataset):
-        for epoch in range(self.start_epoch, self.max_epochs):
-            self.epoch = epoch
-            self.model.train()
-            for batch_idx, batch in enumerate(train_dataset):
-                self.global_step += 1
-                loss = self.training_step(batch)
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-                self.scheduler.step()
-
-                if batch_idx % 10 == 0:
-                    print(
-                        f"Epoch [{epoch}/{self.max_epochs}], Step [{batch_idx}/{len(train_dataset)}], Loss: {loss.item():.4f}"
-                    )
-
-            if (epoch + 1) % self.val_every == 0:
-                val_outputs = []
-                for val_batch in val_dataset:
-                    val_output = self.validation_step(val_batch)
-                    val_outputs.append(val_output)
-                self.validation_end(val_outputs)
-
+def reduce_dataset(dataset, num_samples):
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)  # Shuffle to get a random subset
+    return Subset(dataset, indices[:num_samples])
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -331,7 +314,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--val_every",
         type=int,
-        default=10,
+        default=2,
         help="Validation frequency (in epochs)",
     )
     parser.add_argument(
@@ -363,6 +346,9 @@ if __name__ == "__main__":
     train_ds, val_ds, test_ds = get_loader_brats(
         data_dir=args.data_dir, batch_size=args.batch_size, fold=0
     )
+
+    # train_ds = reduce_dataset(train_ds, num_samples=5)
+    # val_ds = reduce_dataset(val_ds, num_samples=1)
 
     trainer = BraTSTrainer(
         env_type=args.env,
