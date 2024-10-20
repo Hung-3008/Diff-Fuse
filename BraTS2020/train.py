@@ -53,7 +53,7 @@ class FusionDiff(nn.Module):
 
         self.model = BasicUNetDe(
             3,
-            number_targets + number_modality,
+            number_targets,
             number_targets,
             [64, 64, 128, 256, 512, 64],
             act=("LeakyReLU", {"negative_slope": 0.1, "inplace": False}),
